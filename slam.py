@@ -45,7 +45,6 @@ def apply_sequence_override(config, sequence):
     config["Dataset"]["dataset_path"] = os.path.join(
         os.path.dirname(current_path), sequence
     )
-    # Let the dataset adapter auto-resolve stereo_gt/<sequence>.txt.
     config["Dataset"].pop("pose_file", None)
 
 
@@ -191,9 +190,6 @@ class SLAM:
             "end_to_end_without_evaluation_sec": float(
                 end_to_end_without_evaluation_sec
             ),
-            "realtime_throttle": bool(
-                self.config["Training"].get("realtime_throttle", True)
-            ),
         }
 
         Log("Initialization time", initialization_sec, tag="Eval")
@@ -295,7 +291,6 @@ class SLAM:
                 )
 
         elif self.eval_rendering:
-            # Legacy behavior for configs that do not use the experiment CLI modes.
             self.gaussians = self.frontend.gaussians
             kf_indices = self.frontend.kf_indices
             ate = eval_ate(
@@ -351,7 +346,7 @@ if __name__ == "__main__":
     mode_group.add_argument(
         "--timing-only",
         action="store_true",
-        help="Skip final ATE/rendering/PLY; save only timing and pose files",
+        help="Keep original MonoGS runtime behavior, but skip final ATE/rendering/PLY",
     )
 
     parser.add_argument(
@@ -393,8 +388,6 @@ if __name__ == "__main__":
         config["Results"]["eval_rendering"] = experiment_mode == "eval"
         config["Results"]["use_wandb"] = False
         config["Results"]["save_trj"] = False
-        # Experiment timing is compute-limited rather than artificially paced.
-        config["Training"]["realtime_throttle"] = False
 
     save_dir = None
     should_save = config["Results"]["save_results"] or experiment_mode is not None
@@ -416,15 +409,10 @@ if __name__ == "__main__":
         config["Results"]["save_dir"] = save_dir
         mkdir_p(save_dir)
 
-        # Save the user-facing effective configuration before disabling the old
-        # FrontEnd-internal evaluation path below.
         with open(os.path.join(save_dir, "config.yml"), "w", encoding="utf-8") as file:
             yaml.dump(config, file)
         Log("saving results in " + save_dir)
 
-    # The experiment runner performs all final evaluation after the core timer.
-    # Disable MonoGS's old in-FrontEnd ATE/PLY path to avoid duplicate ATE and
-    # to keep evaluation I/O out of the reported compute time.
     if experiment_mode is not None:
         config["Results"]["save_results"] = False
         config["Results"]["save_trj"] = False
