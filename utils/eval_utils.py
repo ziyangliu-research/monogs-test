@@ -1,5 +1,7 @@
 import json
 import os
+import matplotlib
+matplotlib.use("Agg")
 
 import cv2
 import evo
