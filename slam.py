@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import sys
 import time
 from argparse import ArgumentParser
@@ -20,17 +22,79 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import FakeQueue
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
+from utils.trajectory_eval import (
+    evaluate_pose_files,
+    save_frame_indexed_trajectories,
+)
+
+
+def apply_sequence_override(config, sequence):
+    if sequence is None:
+        return
+    if config["Dataset"]["type"] != "tartanair_stereo":
+        raise ValueError("--sequence is currently supported only for tartanair_stereo")
+
+    sequence = sequence.upper()
+    if re.fullmatch(r"S[EH]\d{3}", sequence) is None:
+        raise ValueError(
+            f"Invalid TartanAir stereo sequence '{sequence}'. "
+            "Expected names such as SE000 or SH007."
+        )
+
+    current_path = config["Dataset"]["dataset_path"].rstrip(os.sep)
+    config["Dataset"]["dataset_path"] = os.path.join(
+        os.path.dirname(current_path), sequence
+    )
+    # Let the dataset adapter auto-resolve stereo_gt/<sequence>.txt.
+    config["Dataset"].pop("pose_file", None)
+
+
+def apply_range_override(config, range_spec):
+    """Apply an inclusive START-END range from the CLI.
+
+    Example: --range 100-299 processes exactly 200 source frames.
+    Internally Dataset.end_idx remains exclusive.
+    """
+    if range_spec is None:
+        return
+
+    match = re.fullmatch(r"(\d+)-(\d+)", range_spec.strip())
+    if match is None:
+        raise ValueError("--range must use inclusive START-END syntax, e.g. 0-199")
+
+    start = int(match.group(1))
+    end = int(match.group(2))
+    if end < start:
+        raise ValueError(f"Invalid range {range_spec}: END must be >= START")
+
+    config["Dataset"]["start_idx"] = start
+    config["Dataset"]["end_idx"] = end + 1
+    config["Dataset"]["frame_stride"] = 1
+
+
+def dataset_range_label(config):
+    start = int(config["Dataset"].get("start_idx", 0))
+    end_exclusive = int(config["Dataset"].get("end_idx", -1))
+    if end_exclusive < 0:
+        return f"range_{start:06d}_end"
+    return f"range_{start:06d}_{end_exclusive - 1:06d}"
 
 
 class SLAM:
-    def __init__(self, config, save_dir=None):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
+    def __init__(
+        self,
+        config,
+        save_dir=None,
+        experiment_mode=None,
+        color_refinement=False,
+    ):
+        total_wall_start = time.perf_counter()
 
         self.config = config
         self.save_dir = save_dir
+        self.experiment_mode = experiment_mode
+        self.color_refinement = color_refinement
+
         model_params = munchify(config["model_params"])
         opt_params = munchify(config["opt_params"])
         pipeline_params = munchify(config["pipeline_params"])
@@ -89,7 +153,6 @@ class SLAM:
         self.backend.frontend_queue = frontend_queue
         self.backend.backend_queue = backend_queue
         self.backend.live_mode = self.live_mode
-
         self.backend.set_hyperparams()
 
         self.params_gui = gui_utils.ParamsGUI(
@@ -106,22 +169,136 @@ class SLAM:
             gui_process.start()
             time.sleep(5)
 
+        initialization_sec = time.perf_counter() - total_wall_start
+        torch.cuda.synchronize()
+        streaming_wall_start = time.perf_counter()
+
         backend_process.start()
         self.frontend.run()
         backend_queue.put(["pause"])
-
-        end.record()
         torch.cuda.synchronize()
-        # empty the frontend queue
-        N_frames = len(self.frontend.cameras)
-        FPS = N_frames / (start.elapsed_time(end) * 0.001)
-        Log("Total time", start.elapsed_time(end) * 0.001, tag="Eval")
-        Log("Total FPS", N_frames / (start.elapsed_time(end) * 0.001), tag="Eval")
 
-        if self.eval_rendering:
+        streaming_wall_time_sec = time.perf_counter() - streaming_wall_start
+        end_to_end_without_evaluation_sec = time.perf_counter() - total_wall_start
+        n_frames = len(self.frontend.cameras)
+        fps = n_frames / streaming_wall_time_sec if streaming_wall_time_sec > 0 else 0.0
+
+        timing_result = {
+            "processed_frames": int(n_frames),
+            "initialization_sec": float(initialization_sec),
+            "streaming_wall_time_sec": float(streaming_wall_time_sec),
+            "streaming_fps": float(fps),
+            "end_to_end_without_evaluation_sec": float(
+                end_to_end_without_evaluation_sec
+            ),
+            "realtime_throttle": bool(
+                self.config["Training"].get("realtime_throttle", True)
+            ),
+        }
+
+        Log("Initialization time", initialization_sec, tag="Eval")
+        Log("Streaming wall time", streaming_wall_time_sec, tag="Eval")
+        Log("Streaming FPS", fps, tag="Eval")
+        Log(
+            "End-to-end time without final evaluation",
+            end_to_end_without_evaluation_sec,
+            tag="Eval",
+        )
+
+        if self.experiment_mode in {"eval", "timing"}:
+            trajectory_paths = save_frame_indexed_trajectories(
+                self.frontend.cameras, self.dataset, self.save_dir
+            )
+            with open(
+                os.path.join(self.save_dir, "timing.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(timing_result, f, indent=4)
+
+            if self.experiment_mode == "eval":
+                trajectory_result = evaluate_pose_files(
+                    trajectory_paths["estimated"],
+                    trajectory_paths["ground_truth"],
+                    output_dir=os.path.join(self.save_dir, "trajectory"),
+                    correct_scale=self.monocular,
+                    save_plot=True,
+                )
+                ate = trajectory_result["ate_rmse_m"]
+                Log("RMSE ATE [m]", ate, tag="Eval")
+                Log(
+                    "Pose coverage",
+                    f'{trajectory_result["matched_pose_count"]}/'
+                    f'{trajectory_result["gt_pose_count"]} '
+                    f'({trajectory_result["coverage"] * 100.0:.2f}%)',
+                    tag="Eval",
+                )
+
+                self.gaussians = self.frontend.gaussians
+
+                if self.color_refinement:
+                    while not frontend_queue.empty():
+                        frontend_queue.get()
+                    backend_queue.put(["color_refinement"])
+                    while True:
+                        if frontend_queue.empty():
+                            time.sleep(0.01)
+                            continue
+                        data = frontend_queue.get()
+                        if data[0] == "sync_backend" and frontend_queue.empty():
+                            self.gaussians = data[1]
+                            break
+
+                rendering_result = eval_rendering(
+                    self.frontend.cameras,
+                    self.gaussians,
+                    self.dataset,
+                    self.save_dir,
+                    self.pipeline_params,
+                    self.background,
+                    kf_indices=[],
+                    iteration="final",
+                    interval=1,
+                    skip_keyframes=False,
+                    save_images=True,
+                    mask_nonzero=False,
+                )
+                save_gaussians(
+                    self.gaussians,
+                    self.save_dir,
+                    "final",
+                    final=True,
+                )
+
+                experiment_summary = {
+                    "mode": "eval",
+                    "timing": timing_result,
+                    "trajectory": trajectory_result,
+                    "rendering": rendering_result,
+                    "color_refinement": bool(self.color_refinement),
+                }
+                with open(
+                    os.path.join(self.save_dir, "experiment_summary.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(experiment_summary, f, indent=4)
+
+                wandb.log(
+                    {
+                        "ATE": ate,
+                        "PSNR": rendering_result["mean_psnr"],
+                        "SSIM": rendering_result["mean_ssim"],
+                        "LPIPS": rendering_result["mean_lpips"],
+                        "FPS": fps,
+                    }
+                )
+
+        elif self.eval_rendering:
+            # Legacy behavior for configs that do not use the experiment CLI modes.
             self.gaussians = self.frontend.gaussians
             kf_indices = self.frontend.kf_indices
-            ATE = eval_ate(
+            ate = eval_ate(
                 self.frontend.cameras,
                 self.frontend.kf_indices,
                 self.save_dir,
@@ -129,7 +306,6 @@ class SLAM:
                 final=True,
                 monocular=self.monocular,
             )
-
             rendering_result = eval_rendering(
                 self.frontend.cameras,
                 self.gaussians,
@@ -140,51 +316,15 @@ class SLAM:
                 kf_indices=kf_indices,
                 iteration="before_opt",
             )
-            columns = ["tag", "psnr", "ssim", "lpips", "RMSE ATE", "FPS"]
-            metrics_table = wandb.Table(columns=columns)
-            metrics_table.add_data(
-                "Before",
-                rendering_result["mean_psnr"],
-                rendering_result["mean_ssim"],
-                rendering_result["mean_lpips"],
-                ATE,
-                FPS,
+            wandb.log(
+                {
+                    "ATE": ate,
+                    "PSNR": rendering_result["mean_psnr"],
+                    "SSIM": rendering_result["mean_ssim"],
+                    "LPIPS": rendering_result["mean_lpips"],
+                    "FPS": fps,
+                }
             )
-
-            # re-used the frontend queue to retrive the gaussians from the backend.
-            while not frontend_queue.empty():
-                frontend_queue.get()
-            backend_queue.put(["color_refinement"])
-            while True:
-                if frontend_queue.empty():
-                    time.sleep(0.01)
-                    continue
-                data = frontend_queue.get()
-                if data[0] == "sync_backend" and frontend_queue.empty():
-                    gaussians = data[1]
-                    self.gaussians = gaussians
-                    break
-
-            rendering_result = eval_rendering(
-                self.frontend.cameras,
-                self.gaussians,
-                self.dataset,
-                self.save_dir,
-                self.pipeline_params,
-                self.background,
-                kf_indices=kf_indices,
-                iteration="after_opt",
-            )
-            metrics_table.add_data(
-                "After",
-                rendering_result["mean_psnr"],
-                rendering_result["mean_ssim"],
-                rendering_result["mean_lpips"],
-                ATE,
-                FPS,
-            )
-            wandb.log({"Metrics": metrics_table})
-            save_gaussians(self.gaussians, self.save_dir, "final_after_opt", final=True)
 
         backend_queue.put(["stop"])
         backend_process.join()
@@ -199,60 +339,114 @@ class SLAM:
 
 
 if __name__ == "__main__":
-    # Set up command line argument parser
-    parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--config", type=str)
-    parser.add_argument("--eval", action="store_true")
+    parser = ArgumentParser(description="MonoGS experiment runner")
+    parser.add_argument("--config", type=str, required=True)
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--eval",
+        action="store_true",
+        help="One final ATE plus per-frame PSNR/SSIM/LPIPS and rendered images",
+    )
+    mode_group.add_argument(
+        "--timing-only",
+        action="store_true",
+        help="Skip final ATE/rendering/PLY; save only timing and pose files",
+    )
+
+    parser.add_argument(
+        "--range",
+        dest="range_spec",
+        type=str,
+        default=None,
+        help="Inclusive source-frame range, e.g. 0-199 or 100-299",
+    )
+    parser.add_argument(
+        "--sequence",
+        type=str,
+        default=None,
+        help="TartanAir stereo sequence override, e.g. SE000 or SH007",
+    )
+    parser.add_argument(
+        "--color-refinement",
+        action="store_true",
+        help="Run MonoGS offline color refinement before final rendering metrics",
+    )
 
     args = parser.parse_args(sys.argv[1:])
-
     mp.set_start_method("spawn")
 
-    with open(args.config, "r") as yml:
-        config = yaml.safe_load(yml)
-
     config = load_config(args.config)
-    save_dir = None
+    apply_sequence_override(config, args.sequence)
+    apply_range_override(config, args.range_spec)
 
+    experiment_mode = None
     if args.eval:
-        Log("Running MonoGS in Evaluation Mode")
-        Log("Following config will be overriden")
-        Log("\tsave_results=True")
-        config["Results"]["save_results"] = True
-        Log("\tuse_gui=False")
-        config["Results"]["use_gui"] = False
-        Log("\teval_rendering=True")
-        config["Results"]["eval_rendering"] = True
-        Log("\tuse_wandb=True")
-        config["Results"]["use_wandb"] = True
+        experiment_mode = "eval"
+    elif args.timing_only:
+        experiment_mode = "timing"
 
-    if config["Results"]["save_results"]:
+    if experiment_mode is not None:
+        Log(f"Running MonoGS in {experiment_mode.upper()} experiment mode")
+        config["Results"]["save_results"] = True
+        config["Results"]["use_gui"] = False
+        config["Results"]["eval_rendering"] = experiment_mode == "eval"
+        config["Results"]["use_wandb"] = False
+        config["Results"]["save_trj"] = False
+        # Experiment timing is compute-limited rather than artificially paced.
+        config["Training"]["realtime_throttle"] = False
+
+    save_dir = None
+    should_save = config["Results"]["save_results"] or experiment_mode is not None
+    if should_save:
         mkdir_p(config["Results"]["save_dir"])
         current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        path = config["Dataset"]["dataset_path"].split("/")
-        save_dir = os.path.join(
-            config["Results"]["save_dir"], path[-3] + "_" + path[-2], current_datetime
+        dataset_type = config["Dataset"]["type"]
+        sequence_name = os.path.basename(
+            config["Dataset"]["dataset_path"].rstrip(os.sep)
         )
-        tmp = args.config
-        tmp = tmp.split(".")[0]
+        dataset_tag = f"{dataset_type}_{sequence_name}"
+        range_tag = dataset_range_label(config)
+        save_dir = os.path.join(
+            config["Results"]["save_dir"],
+            dataset_tag,
+            range_tag,
+            current_datetime,
+        )
         config["Results"]["save_dir"] = save_dir
         mkdir_p(save_dir)
-        with open(os.path.join(save_dir, "config.yml"), "w") as file:
-            documents = yaml.dump(config, file)
+
+        # Save the user-facing effective configuration before disabling the old
+        # FrontEnd-internal evaluation path below.
+        with open(os.path.join(save_dir, "config.yml"), "w", encoding="utf-8") as file:
+            yaml.dump(config, file)
         Log("saving results in " + save_dir)
-        run = wandb.init(
-            project="MonoGS",
-            name=f"{tmp}_{current_datetime}",
-            config=config,
-            mode=None if config["Results"]["use_wandb"] else "disabled",
-        )
-        wandb.define_metric("frame_idx")
-        wandb.define_metric("ate*", step_metric="frame_idx")
 
-    slam = SLAM(config, save_dir=save_dir)
+    # The experiment runner performs all final evaluation after the core timer.
+    # Disable MonoGS's old in-FrontEnd ATE/PLY path to avoid duplicate ATE and
+    # to keep evaluation I/O out of the reported compute time.
+    if experiment_mode is not None:
+        config["Results"]["save_results"] = False
+        config["Results"]["save_trj"] = False
 
+    run = wandb.init(
+        project="MonoGS",
+        name=(
+            f"{os.path.splitext(args.config)[0]}_"
+            f"{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+        ),
+        config=config,
+        mode=None if config["Results"]["use_wandb"] else "disabled",
+    )
+    wandb.define_metric("frame_idx")
+    wandb.define_metric("ate*", step_metric="frame_idx")
+
+    slam = SLAM(
+        config,
+        save_dir=save_dir,
+        experiment_mode=experiment_mode,
+        color_refinement=args.color_refinement,
+    )
     slam.run()
     wandb.finish()
-
-    # All done
     Log("Done.")
