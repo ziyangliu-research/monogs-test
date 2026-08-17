@@ -116,11 +116,9 @@ class FrontEnd(mp.Process):
         self.iteration_count = 0
         self.occ_aware_visibility = {}
         self.current_window = []
-        # remove everything from the queues
         while not self.backend_queue.empty():
             self.backend_queue.get()
 
-        # Initialise the frame at the ground truth pose
         viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
 
         self.kf_indices = []
@@ -232,13 +230,11 @@ class FrontEnd(mp.Process):
     ):
         N_dont_touch = 2
         window = [cur_frame_idx] + window
-        # remove frames which has little overlap with the current frame
         curr_frame = self.cameras[cur_frame_idx]
         to_remove = []
         removed_frame = None
         for i in range(N_dont_touch, len(window)):
             kf_idx = window[i]
-            # szymkiewicz–simpson coefficient
             intersection = torch.logical_and(
                 cur_frame_visibility_filter, occ_aware_visibility[kf_idx]
             ).count_nonzero()
@@ -263,7 +259,6 @@ class FrontEnd(mp.Process):
         kf_0_WC = torch.linalg.inv(getWorld2View2(curr_frame.R, curr_frame.T))
 
         if len(window) > self.config["Training"]["window_size"]:
-            # we need to find the keyframe to remove...
             inv_dist = []
             for i in range(N_dont_touch, len(window)):
                 inv_dists = []
@@ -348,6 +343,11 @@ class FrontEnd(mp.Process):
             if self.frontend_queue.empty():
                 tic.record()
                 if cur_frame_idx >= len(self.dataset):
+                    # Do not stop before the last keyframe/init update has been
+                    # processed and synchronized back from the backend.
+                    if self.requested_init or self.requested_keyframe > 0:
+                        time.sleep(0.01)
+                        continue
                     if self.save_results:
                         eval_ate(
                             self.cameras,
@@ -391,7 +391,6 @@ class FrontEnd(mp.Process):
                     len(self.current_window) == self.window_size
                 )
 
-                # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
 
                 current_window_dict = {}
@@ -478,7 +477,6 @@ class FrontEnd(mp.Process):
                 toc.record()
                 torch.cuda.synchronize()
                 if create_kf and self.realtime_throttle:
-                    # Optional real-time pacing from the released MonoGS code.
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
             else:
