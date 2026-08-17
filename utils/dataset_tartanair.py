@@ -82,6 +82,13 @@ class TartanAirStereoParser:
         candidates = [
             os.path.join(self.input_folder, "pose_left.txt"),
             os.path.join(self.input_folder, f"{sequence_name}.txt"),
+            os.path.join(
+                dataset_root,
+                "ground_truth",
+                "stereo_gt",
+                f"{sequence_name}.txt",
+            ),
+            # Legacy fallback for challenge layouts that put stereo_gt at the root.
             os.path.join(dataset_root, "stereo_gt", f"{sequence_name}.txt"),
         ]
 
