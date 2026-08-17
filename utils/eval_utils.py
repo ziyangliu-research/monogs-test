@@ -1,5 +1,7 @@
+import csv
 import json
 import os
+
 import matplotlib
 matplotlib.use("Agg")
 
@@ -8,11 +10,7 @@ import evo
 import numpy as np
 import torch
 from evo.core import metrics, trajectory
-from evo.core.metrics import PoseRelation, Unit
-from evo.core.trajectory import PosePath3D, PoseTrajectory3D
-from evo.tools import plot
-from evo.tools.plot import PlotMode
-from evo.tools.settings import SETTINGS
+from evo.core.trajectory import PosePath3D
 from matplotlib import pyplot as plt
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -22,24 +20,23 @@ from gaussian_splatting.utils.image_utils import psnr
 from gaussian_splatting.utils.loss_utils import ssim
 from gaussian_splatting.utils.system_utils import mkdir_p
 from utils.logging_utils import Log
+from utils.trajectory_eval import source_frame_id
 
 
 def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
-    ## Plot
     traj_ref = PosePath3D(poses_se3=poses_gt)
     traj_est = PosePath3D(poses_se3=poses_est)
     traj_est_aligned = trajectory.align_trajectory(
         traj_est, traj_ref, correct_scale=monocular
     )
 
-    ## RMSE
     pose_relation = metrics.PoseRelation.translation_part
     data = (traj_ref, traj_est_aligned)
     ape_metric = metrics.APE(pose_relation)
     ape_metric.process_data(data)
     ape_stat = ape_metric.get_statistic(metrics.StatisticsType.rmse)
     ape_stats = ape_metric.get_all_statistics()
-    Log("RMSE ATE \[m]", ape_stat, tag="Eval")
+    Log("RMSE ATE \\[m]", ape_stat, tag="Eval")
 
     with open(
         os.path.join(plot_dir, "stats_{}.json".format(str(label))),
@@ -48,26 +45,27 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     ) as f:
         json.dump(ape_stats, f, indent=4)
 
-    plot_mode = evo.tools.plot.PlotMode.xy
+    # Keep this simple so it remains compatible with both old and new matplotlib.
+    gt_xyz = np.asarray(traj_ref.positions_xyz)
+    est_xyz = np.asarray(traj_est_aligned.positions_xyz)
     fig = plt.figure()
-    ax = evo.tools.plot.prepare_axis(fig, plot_mode)
-    ax.set_title(f"ATE RMSE: {ape_stat}")
-    evo.tools.plot.traj(ax, plot_mode, traj_ref, "--", "gray", "gt")
-    evo.tools.plot.traj_colormap(
-        ax,
-        traj_est_aligned,
-        ape_metric.error,
-        plot_mode,
-        min_map=ape_stats["min"],
-        max_map=ape_stats["max"],
-    )
+    ax = fig.add_subplot(111)
+    ax.plot(gt_xyz[:, 0], gt_xyz[:, 1], label="GT")
+    ax.plot(est_xyz[:, 0], est_xyz[:, 1], label="Estimate")
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_title(f"ATE RMSE: {ape_stat:.6f} m")
     ax.legend()
-    plt.savefig(os.path.join(plot_dir, "evo_2dplot_{}.png".format(str(label))), dpi=90)
+    fig.tight_layout()
+    fig.savefig(os.path.join(plot_dir, "evo_2dplot_{}.png".format(str(label))), dpi=90)
+    plt.close(fig)
 
     return ape_stat
 
 
 def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False):
+    """Legacy MonoGS keyframe ATE evaluator kept for existing configs."""
     trj_data = dict()
     latest_frame_idx = kf_ids[-1] + 2 if final else kf_ids[-1] + 1
     trj_id, trj_est, trj_gt = [], [], []
@@ -122,63 +120,135 @@ def eval_rendering(
     save_dir,
     pipe,
     background,
-    kf_indices,
+    kf_indices=None,
     iteration="final",
+    interval=5,
+    skip_keyframes=True,
+    save_images=False,
+    mask_nonzero=True,
 ):
-    interval = 5
-    img_pred, img_gt, saved_frame_idx = [], [], []
-    end_idx = len(frames) - 1 if iteration == "final" or "before_opt" else iteration
+    """Render and evaluate frames from the final Gaussian map.
+
+    For the unified experiment protocol use interval=1, skip_keyframes=False,
+    save_images=True and mask_nonzero=False. The defaults preserve the released
+    MonoGS behavior for legacy configs.
+    """
+    kf_indices = set(kf_indices or [])
+    frame_ids = sorted(int(idx) for idx in frames.keys())
+    if isinstance(iteration, int):
+        frame_ids = [idx for idx in frame_ids if idx < iteration]
+    frame_ids = frame_ids[:: max(1, int(interval))]
+
     psnr_array, ssim_array, lpips_array = [], [], []
+    per_frame = []
     cal_lpips = LearnedPerceptualImagePatchSimilarity(
         net_type="alex", normalize=True
     ).to("cuda")
-    for idx in range(0, end_idx, interval):
-        if idx in kf_indices:
-            continue
-        saved_frame_idx.append(idx)
-        frame = frames[idx]
-        gt_image, _, _ = dataset[idx]
-
-        rendering = render(frame, gaussians, pipe, background)["render"]
-        image = torch.clamp(rendering, 0.0, 1.0)
-
-        gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
-        pred = (image.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(
-            np.uint8
-        )
-        gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
-        pred = cv2.cvtColor(pred, cv2.COLOR_BGR2RGB)
-        img_pred.append(pred)
-        img_gt.append(gt)
-
-        mask = gt_image > 0
-
-        psnr_score = psnr((image[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0))
-        ssim_score = ssim((image).unsqueeze(0), (gt_image).unsqueeze(0))
-        lpips_score = cal_lpips((image).unsqueeze(0), (gt_image).unsqueeze(0))
-
-        psnr_array.append(psnr_score.item())
-        ssim_array.append(ssim_score.item())
-        lpips_array.append(lpips_score.item())
-
-    output = dict()
-    output["mean_psnr"] = float(np.mean(psnr_array))
-    output["mean_ssim"] = float(np.mean(ssim_array))
-    output["mean_lpips"] = float(np.mean(lpips_array))
-
-    Log(
-        f'mean psnr: {output["mean_psnr"]}, ssim: {output["mean_ssim"]}, lpips: {output["mean_lpips"]}',
-        tag="Eval",
-    )
 
     psnr_save_dir = os.path.join(save_dir, "psnr", str(iteration))
     mkdir_p(psnr_save_dir)
+    rendered_dir = os.path.join(psnr_save_dir, "rendered")
+    gt_dir = os.path.join(psnr_save_dir, "gt")
+    if save_images:
+        mkdir_p(rendered_dir)
+        mkdir_p(gt_dir)
 
-    json.dump(
-        output,
-        open(os.path.join(psnr_save_dir, "final_result.json"), "w", encoding="utf-8"),
-        indent=4,
+    for idx in frame_ids:
+        if skip_keyframes and idx in kf_indices:
+            continue
+
+        frame = frames[idx]
+        gt_image, _, _ = dataset[idx]
+        rendering = render(frame, gaussians, pipe, background)["render"]
+        image = torch.clamp(rendering, 0.0, 1.0)
+
+        if mask_nonzero:
+            mask = gt_image > 0
+            psnr_score = psnr(
+                (image[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0)
+            )
+        else:
+            psnr_score = psnr(image.unsqueeze(0), gt_image.unsqueeze(0))
+
+        ssim_score = ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        lpips_score = cal_lpips(image.unsqueeze(0), gt_image.unsqueeze(0))
+
+        psnr_value = float(psnr_score.item())
+        ssim_value = float(ssim_score.item())
+        lpips_value = float(lpips_score.item())
+        frame_id = source_frame_id(dataset, idx)
+
+        psnr_array.append(psnr_value)
+        ssim_array.append(ssim_value)
+        lpips_array.append(lpips_value)
+        per_frame.append(
+            {
+                "local_idx": int(idx),
+                "frame_id": int(frame_id),
+                "psnr": psnr_value,
+                "ssim": ssim_value,
+                "lpips": lpips_value,
+            }
+        )
+
+        if save_images:
+            gt_u8 = (
+                gt_image.detach().cpu().numpy().transpose((1, 2, 0)) * 255.0
+            ).clip(0, 255).astype(np.uint8)
+            pred_u8 = (
+                image.detach().cpu().numpy().transpose((1, 2, 0)) * 255.0
+            ).clip(0, 255).astype(np.uint8)
+            cv2.imwrite(
+                os.path.join(rendered_dir, f"{frame_id:06d}.png"),
+                cv2.cvtColor(pred_u8, cv2.COLOR_RGB2BGR),
+            )
+            cv2.imwrite(
+                os.path.join(gt_dir, f"{frame_id:06d}.png"),
+                cv2.cvtColor(gt_u8, cv2.COLOR_RGB2BGR),
+            )
+
+    if not per_frame:
+        raise RuntimeError("No frames were selected for rendering evaluation")
+
+    output = {
+        "num_frames": len(per_frame),
+        "mean_psnr": float(np.mean(psnr_array)),
+        "mean_ssim": float(np.mean(ssim_array)),
+        "mean_lpips": float(np.mean(lpips_array)),
+    }
+
+    Log(
+        f'mean psnr: {output["mean_psnr"]}, '
+        f'ssim: {output["mean_ssim"]}, '
+        f'lpips: {output["mean_lpips"]}, '
+        f'frames: {output["num_frames"]}',
+        tag="Eval",
     )
+
+    with open(
+        os.path.join(psnr_save_dir, "final_result.json"), "w", encoding="utf-8"
+    ) as f:
+        json.dump(output, f, indent=4)
+
+    with open(
+        os.path.join(psnr_save_dir, "per_frame_metrics.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(per_frame, f, indent=4)
+
+    with open(
+        os.path.join(psnr_save_dir, "per_frame_metrics.csv"),
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["local_idx", "frame_id", "psnr", "ssim", "lpips"]
+        )
+        writer.writeheader()
+        writer.writerows(per_frame)
+
     return output
 
 
