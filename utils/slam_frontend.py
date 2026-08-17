@@ -53,6 +53,9 @@ class FrontEnd(mp.Process):
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
         self.single_thread = self.config["Training"]["single_thread"]
+        self.realtime_throttle = self.config["Training"].get(
+            "realtime_throttle", True
+        )
 
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
@@ -474,8 +477,8 @@ class FrontEnd(mp.Process):
                     )
                 toc.record()
                 torch.cuda.synchronize()
-                if create_kf:
-                    # throttle at 3fps when keyframe is added
+                if create_kf and self.realtime_throttle:
+                    # Optional real-time pacing from the released MonoGS code.
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
             else:
