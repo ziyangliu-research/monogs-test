@@ -173,6 +173,7 @@ class TartanAirStereoDataset(StereoDataset):
         self.color_paths_r = parser.color_paths_r
         self.poses = parser.poses
         self.pose_file = parser.pose_file
+        self.frame_indices = parser.indices
 
         print(
             "MonoGS: loaded TartanAir stereo sequence "
