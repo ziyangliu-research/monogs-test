@@ -181,6 +181,7 @@ class SLAM:
         end_to_end_without_evaluation_sec = time.perf_counter() - total_wall_start
         n_frames = len(self.frontend.cameras)
         fps = n_frames / streaming_wall_time_sec if streaming_wall_time_sec > 0 else 0.0
+        final_gaussian_count = int(self.frontend.gaussians.get_xyz.shape[0])
 
         timing_result = {
             "processed_frames": int(n_frames),
@@ -190,11 +191,13 @@ class SLAM:
             "end_to_end_without_evaluation_sec": float(
                 end_to_end_without_evaluation_sec
             ),
+            "final_gaussian_count": final_gaussian_count,
         }
 
         Log("Initialization time", initialization_sec, tag="Eval")
         Log("Streaming wall time", streaming_wall_time_sec, tag="Eval")
         Log("Streaming FPS", fps, tag="Eval")
+        Log("Final Gaussian count", f"{final_gaussian_count:,}", tag="Eval")
         Log(
             "End-to-end time without final evaluation",
             end_to_end_without_evaluation_sec,
@@ -271,6 +274,7 @@ class SLAM:
                     "timing": timing_result,
                     "trajectory": trajectory_result,
                     "rendering": rendering_result,
+                    "final_gaussian_count": final_gaussian_count,
                     "color_refinement": bool(self.color_refinement),
                 }
                 with open(
@@ -287,6 +291,7 @@ class SLAM:
                         "SSIM": rendering_result["mean_ssim"],
                         "LPIPS": rendering_result["mean_lpips"],
                         "FPS": fps,
+                        "Gaussian Count": final_gaussian_count,
                     }
                 )
 
@@ -318,6 +323,7 @@ class SLAM:
                     "SSIM": rendering_result["mean_ssim"],
                     "LPIPS": rendering_result["mean_lpips"],
                     "FPS": fps,
+                    "Gaussian Count": final_gaussian_count,
                 }
             )
 
