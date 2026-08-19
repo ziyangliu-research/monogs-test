@@ -6,8 +6,8 @@ Dataset:
   # Optional override. If omitted, the loader automatically checks:
   #   1) <dataset_path>/pose_left.txt
   #   2) <dataset_path>/SE000.txt
-  #   3) /home/shiyo/Desktop/Datasets/TartanAir_Stereo_Challenge/stereo_gt/SE000.txt
-  # pose_file: "/home/shiyo/Desktop/Datasets/TartanAir_Stereo_Challenge/stereo_gt/SE000.txt"
+  #   3) /home/shiyo/Desktop/Datasets/TartanAir_Stereo_Challenge/ground_truth/stereo_gt/SE000.txt
+  # pose_file: "/home/shiyo/Desktop/Datasets/TartanAir_Stereo_Challenge/ground_truth/stereo_gt/SE000.txt"
 
   start_idx: 0
   end_idx: -1
