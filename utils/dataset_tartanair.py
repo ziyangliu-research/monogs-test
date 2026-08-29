@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import trimesh
 
-from utils.dataset import StereoDataset
+from utils.dataset import MonocularDataset, StereoDataset
 
 
 class TartanAirStereoParser:
@@ -135,6 +135,49 @@ class TartanAirStereoParser:
         return poses
 
 
+class TartanAirMonoParser(TartanAirStereoParser):
+    """Left-camera-only parser for the same TartanAir challenge sequences."""
+
+    def __init__(
+        self,
+        input_folder,
+        pose_file=None,
+        start_idx=0,
+        end_idx=-1,
+        frame_stride=1,
+    ):
+        self.input_folder = os.path.abspath(os.path.expanduser(input_folder))
+        self.start_idx = int(start_idx)
+        self.end_idx = int(end_idx) if end_idx is not None else -1
+        self.frame_stride = int(frame_stride)
+
+        if self.start_idx < 0:
+            raise ValueError("TartanAir start_idx must be >= 0")
+        if self.frame_stride <= 0:
+            raise ValueError("TartanAir frame_stride must be > 0")
+
+        all_left = sorted(glob.glob(os.path.join(self.input_folder, "image_left", "*.png")))
+        if not all_left:
+            raise FileNotFoundError(
+                f"No left images found under {self.input_folder}/image_left"
+            )
+
+        total = len(all_left)
+        stop = total if self.end_idx < 0 else min(self.end_idx, total)
+        if self.start_idx >= stop:
+            raise ValueError(
+                f"Invalid TartanAir frame range [{self.start_idx}, {self.end_idx}) "
+                f"for {total} frames"
+            )
+
+        self.indices = list(range(self.start_idx, stop, self.frame_stride))
+        self.color_paths = [all_left[i] for i in self.indices]
+        self.n_img = len(self.indices)
+
+        self.pose_file = self._resolve_pose_file(pose_file)
+        self.poses = self._load_poses(self.pose_file, total)
+
+
 class TartanAirStereoDataset(StereoDataset):
     """MonoGS stereo adapter for TartanAir v1 challenge data."""
 
@@ -232,3 +275,29 @@ class TartanAirStereoDataset(StereoDataset):
         pose = torch.from_numpy(pose).to(device=self.device, dtype=self.dtype)
 
         return image, depth, pose
+
+
+class TartanAirMonocularDataset(MonocularDataset):
+    """MonoGS monocular adapter using only TartanAir's left RGB camera."""
+
+    def __init__(self, args, path, config):
+        super().__init__(args, path, config)
+        dataset_cfg = config["Dataset"]
+        parser = TartanAirMonoParser(
+            dataset_cfg["dataset_path"],
+            pose_file=dataset_cfg.get("pose_file"),
+            start_idx=dataset_cfg.get("start_idx", 0),
+            end_idx=dataset_cfg.get("end_idx", -1),
+            frame_stride=dataset_cfg.get("frame_stride", 1),
+        )
+        self.num_imgs = parser.n_img
+        self.color_paths = parser.color_paths
+        self.poses = parser.poses
+        self.pose_file = parser.pose_file
+        self.frame_indices = parser.indices
+
+        print(
+            "MonoGS: loaded TartanAir monocular sequence "
+            f"{dataset_cfg['dataset_path']} ({self.num_imgs} left-camera frames, "
+            f"GT={self.pose_file})"
+        )
