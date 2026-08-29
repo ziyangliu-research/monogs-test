@@ -41,7 +41,7 @@ for SEQ in "${SEQUENCES[@]}"; do
     echo "LOG  : $LOG_FILE" | tee -a "$STATUS_FILE"
     echo "============================================================" | tee -a "$STATUS_FILE"
 
-    python run_tartanair_holdout_safe.py \
+    python run_tartanair_holdout_safe_entry.py \
         --config configs/stereo/tartanair/SE000.yaml \
         --sequence "$SEQ" \
         --holdout-every 5 \
