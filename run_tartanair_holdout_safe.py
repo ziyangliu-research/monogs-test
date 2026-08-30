@@ -110,6 +110,14 @@ def main():
     parser.add_argument("--holdout-every", type=int, default=5)
     parser.add_argument("--holdout-offset", type=int, default=4)
     parser.add_argument("--save-images", action="store_true")
+    parser.add_argument(
+        "--color-refinement",
+        action="store_true",
+        help=(
+            "Run MonoGS's released global color refinement after online SLAM and "
+            "evaluate Train/Test rendering metrics on the refined map"
+        ),
+    )
     args = parser.parse_args(sys.argv[1:])
 
     if args.holdout_every <= 1:
@@ -137,6 +145,8 @@ def main():
     dataset_tag = f'{config["Dataset"]["type"]}_{sequence_name}'
     range_tag = monogs_slam.dataset_range_label(config)
     split_tag = f"holdout_{args.holdout_every}_{args.holdout_offset}"
+    if args.color_refinement:
+        split_tag += "_color_refinement"
     save_dir = os.path.join(
         config["Results"]["save_dir"],
         dataset_tag,
@@ -174,7 +184,7 @@ def main():
         config,
         save_dir=save_dir,
         experiment_mode="eval",
-        color_refinement=False,
+        color_refinement=bool(args.color_refinement),
     )
 
     # From here on, use only CPU/files produced while backend was alive. Do not
@@ -235,6 +245,7 @@ def main():
         "final_gaussian_count": gaussian_count,
         "benchmark_row": row,
         "cuda_ipc_safe_eval": True,
+        "color_refinement": bool(args.color_refinement),
     }
     with open(
         os.path.join(save_dir, "holdout_summary.json"), "w", encoding="utf-8"
@@ -252,8 +263,9 @@ def main():
         f'{sequence_name} | MaxMap={row["MaxMap"]} | '
         f'Train={row["Train PSNR"]:.3f}/{row["Train SSIM"]:.4f} | '
         f'Test={row["Test PSNR"]:.3f}/{row["Test SSIM"]:.4f} | '
-        f'ATE={row["ATE(m)"]:.6f} m | FPS={row["FPS"]:.3f} | '
-        f'Gaussians={row["Gaussians"]:,}',
+        f'ATE={row["ATE(m)"]:.6f} m | OnlineFPS={row["FPS"]:.3f} | '
+        f'Gaussians={row["Gaussians"]:,} | '
+        f'ColorRefinement={bool(args.color_refinement)}',
         tag="Eval",
     )
     Log("Done.")
