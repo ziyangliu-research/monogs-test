@@ -2,10 +2,12 @@ import csv
 import json
 import os
 import sys
+import time
 from argparse import ArgumentParser
 from datetime import datetime
 
 import numpy as np
+import torch
 import torch.multiprocessing as mp
 import yaml
 
@@ -52,12 +54,33 @@ class ProducerQueueProxy:
 
 
 class BenchmarkBackEnd(monogs_slam.BackEnd):
-    """Released MonoGS backend with shutdown-only queue safety."""
+    """Released MonoGS backend with benchmark-only lifecycle/timing hooks."""
 
     def set_hyperparams(self):
         super().set_hyperparams()
         if not isinstance(self.frontend_queue, ProducerQueueProxy):
             self.frontend_queue = ProducerQueueProxy(self.frontend_queue)
+
+    def color_refinement(self):
+        """Time the released color_refinement() without changing its logic."""
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        super().color_refinement()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+
+        timing = {
+            "color_refinement_sec": float(elapsed),
+            "iterations": 26000,
+        }
+        save_dir = self.config["Results"]["save_dir"]
+        with open(
+            os.path.join(save_dir, "offline_timing.json"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(timing, f, indent=4)
+        Log("Color refinement wall time", elapsed, tag="Eval")
 
 
 def summarize_rows(rows):
@@ -78,19 +101,27 @@ def write_benchmark_row(
     train_result,
     test_result,
     trajectory_result,
-    fps,
+    online_fps,
+    online_time_sec,
+    offline_time_sec,
     gaussian_count,
 ):
+    system_total_sec = float(online_time_sec) + float(offline_time_sec)
     row = {
         "Sequence": sequence,
         "MaxMap": int(max_map["frames"]),
         "Train PSNR": float(train_result["mean_psnr"]),
         "Train SSIM": float(train_result["mean_ssim"]),
+        "Train LPIPS": float(train_result["mean_lpips"]),
         "Test PSNR": float(test_result["mean_psnr"]),
         "Test SSIM": float(test_result["mean_ssim"]),
+        "Test LPIPS": float(test_result["mean_lpips"]),
         "ATE(m)": float(trajectory_result["ate_rmse_m"]),
-        "FPS": float(fps),
         "Gaussians": int(gaussian_count),
+        "Online FPS": float(online_fps),
+        "Online Time(s)": float(online_time_sec),
+        "Offline Refine(s)": float(offline_time_sec),
+        "System Total(s)": float(system_total_sec),
     }
     path = os.path.join(save_dir, "benchmark_row.csv")
     with open(path, "w", encoding="utf-8", newline="") as f:
@@ -204,6 +235,22 @@ def main():
     ) as f:
         per_frame = json.load(f)
 
+    offline_time_sec = 0.0
+    offline_timing_path = os.path.join(save_dir, "offline_timing.json")
+    if args.color_refinement:
+        if not os.path.isfile(offline_timing_path):
+            raise RuntimeError(
+                "Color refinement was requested but offline_timing.json was not produced"
+            )
+        with open(offline_timing_path, "r", encoding="utf-8") as f:
+            offline_timing = json.load(f)
+        offline_time_sec = float(offline_timing["color_refinement_sec"])
+    else:
+        offline_timing = {
+            "color_refinement_sec": 0.0,
+            "iterations": 0,
+        }
+
     train_rows, test_rows = [], []
     for row in per_frame:
         frame_id = int(row["frame_id"])
@@ -215,7 +262,8 @@ def main():
     train_result = summarize_rows(train_rows)
     test_result = summarize_rows(test_rows)
     max_map = largest_contiguous_map(runner.dataset, runner.frontend.cameras)
-    fps = float(timing_result["streaming_fps"])
+    online_fps = float(timing_result["streaming_fps"])
+    online_time_sec = float(timing_result["end_to_end_without_evaluation_sec"])
     gaussian_count = int(timing_result["final_gaussian_count"])
 
     row = write_benchmark_row(
@@ -225,7 +273,9 @@ def main():
         train_result,
         test_result,
         trajectory_result,
-        fps,
+        online_fps,
+        online_time_sec,
+        offline_time_sec,
         gaussian_count,
     )
 
@@ -239,6 +289,10 @@ def main():
         },
         "max_map": max_map,
         "timing": timing_result,
+        "offline_timing": offline_timing,
+        "system_total_sec_excluding_metric_evaluation": float(
+            online_time_sec + offline_time_sec
+        ),
         "trajectory": trajectory_result,
         "train_rendering": train_result,
         "test_rendering": test_result,
@@ -261,11 +315,16 @@ def main():
     Log(
         "Benchmark row",
         f'{sequence_name} | MaxMap={row["MaxMap"]} | '
-        f'Train={row["Train PSNR"]:.3f}/{row["Train SSIM"]:.4f} | '
-        f'Test={row["Test PSNR"]:.3f}/{row["Test SSIM"]:.4f} | '
-        f'ATE={row["ATE(m)"]:.6f} m | OnlineFPS={row["FPS"]:.3f} | '
+        f'Train={row["Train PSNR"]:.3f}/{row["Train SSIM"]:.4f}/'
+        f'{row["Train LPIPS"]:.4f} | '
+        f'Test={row["Test PSNR"]:.3f}/{row["Test SSIM"]:.4f}/'
+        f'{row["Test LPIPS"]:.4f} | '
+        f'ATE={row["ATE(m)"]:.6f} m | '
         f'Gaussians={row["Gaussians"]:,} | '
-        f'ColorRefinement={bool(args.color_refinement)}',
+        f'OnlineFPS={row["Online FPS"]:.3f} | '
+        f'Online={row["Online Time(s)"]:.1f}s | '
+        f'Offline={row["Offline Refine(s)"]:.1f}s | '
+        f'Total={row["System Total(s)"]:.1f}s',
         tag="Eval",
     )
     Log("Done.")
