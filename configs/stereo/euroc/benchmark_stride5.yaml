@@ -1,0 +1,19 @@
+# Paper benchmark wrapper for EuRoC.
+#
+# All MonoGS EuRoC calibration / tracking / mapping / Gaussian parameters are
+# inherited unchanged from the released stereo EuRoC mh02.yaml configuration.
+# Benchmark-only protocol changes:
+#   1) start from raw frame 0 instead of the released mh02 start_idx=800;
+#   2) temporally subsample the input by frame_stride=5;
+#   3) the runner applies the same 8:2 held-out evaluation used for TartanAir.
+#
+# The sequence path below is only a default. run_euroc_holdout_paired_entry.py
+# replaces it for MH02 / V101 / V201 / MH05.
+
+inherit_from: "configs/stereo/euroc/mh02.yaml"
+
+Dataset:
+  dataset_path: "/home/shiyo/Desktop/Datasets/EuRoC/extracted/machine_hall/machine_hall/MH_02_easy"
+  start_idx: 0
+  end_idx: -1
+  frame_stride: 5
