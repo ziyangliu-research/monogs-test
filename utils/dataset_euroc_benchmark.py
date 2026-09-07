@@ -1,6 +1,5 @@
 import os
 
-import numpy as np
 import yaml
 
 from utils.dataset import EurocDataset
@@ -20,7 +19,7 @@ class EuRoCBenchmarkDataset(EurocDataset):
         dataset_path = os.path.abspath(os.path.expanduser(dataset_cfg["dataset_path"]))
         dataset_cfg["dataset_path"] = dataset_path
 
-        self._validate_layout_and_calibration(dataset_cfg)
+        self._validate_layout(dataset_cfg)
 
         start_idx = int(dataset_cfg.get("start_idx", 0))
         end_idx = int(dataset_cfg.get("end_idx", -1))
@@ -86,7 +85,17 @@ class EuRoCBenchmarkDataset(EurocDataset):
         )
 
     @staticmethod
-    def _validate_layout_and_calibration(dataset_cfg):
+    def _validate_layout(dataset_cfg):
+        """Validate only the EuRoC directory layout and image resolution metadata.
+
+        The benchmark intentionally uses MonoGS's released EuRoC calibration
+        values unchanged. EuRoC sensor.yaml metadata is therefore not used to
+        overwrite or numerically validate MonoGS's hard-coded raw/rectified
+        calibration. In particular, released MonoGS's cam1 distortion parameters
+        are not byte-for-byte identical to the sensor.yaml shipped with some
+        EuRoC sequences; treating that difference as an error would reject the
+        very dataset/configuration that the released baseline is intended to run.
+        """
         root = os.path.abspath(os.path.expanduser(dataset_cfg["dataset_path"]))
         required = [
             os.path.join(root, "mav0", "cam0", "data"),
@@ -105,9 +114,9 @@ class EuRoCBenchmarkDataset(EurocDataset):
         calibration = dataset_cfg["Calibration"]
         expected_resolution = [int(calibration["width"]), int(calibration["height"])]
 
-        # EuRoC ships calibration per camera. Validate only the raw sensor model;
-        # rectified intrinsics/R matrices remain exactly those in MonoGS's official
-        # mh02.yaml configuration.
+        # Resolution is safe to validate because a mismatch would make the
+        # released rectification maps/image dimensions invalid. Numerical camera
+        # calibration remains exactly the values in MonoGS's official YAML.
         for camera_name in ("cam0", "cam1"):
             sensor_path = os.path.join(root, "mav0", camera_name, "sensor.yaml")
             with open(sensor_path, "r", encoding="utf-8") as f:
@@ -119,38 +128,3 @@ class EuRoCBenchmarkDataset(EurocDataset):
                     f"{camera_name} resolution mismatch in {sensor_path}: "
                     f"sensor.yaml={resolution}, MonoGS={expected_resolution}"
                 )
-
-            intrinsics = sensor.get("intrinsics")
-            if intrinsics is not None:
-                raw = calibration[camera_name]["raw"]
-                expected_intrinsics = np.array(
-                    [raw["fx"], raw["fy"], raw["cx"], raw["cy"]], dtype=np.float64
-                )
-                actual_intrinsics = np.asarray(intrinsics, dtype=np.float64)
-                if actual_intrinsics.shape != (4,) or not np.allclose(
-                    actual_intrinsics, expected_intrinsics, rtol=0.0, atol=1e-6
-                ):
-                    raise ValueError(
-                        f"{camera_name} intrinsics in {sensor_path} do not match "
-                        "MonoGS's official EuRoC calibration: "
-                        f"sensor.yaml={actual_intrinsics.tolist()}, "
-                        f"MonoGS={expected_intrinsics.tolist()}"
-                    )
-
-            distortion = sensor.get("distortion_coefficients")
-            if distortion is not None:
-                raw = calibration[camera_name]["raw"]
-                expected_distortion = np.array(
-                    [raw["k1"], raw["k2"], raw["p1"], raw["p2"]],
-                    dtype=np.float64,
-                )
-                actual_distortion = np.asarray(distortion, dtype=np.float64)
-                if actual_distortion.shape != (4,) or not np.allclose(
-                    actual_distortion, expected_distortion, rtol=0.0, atol=1e-6
-                ):
-                    raise ValueError(
-                        f"{camera_name} distortion in {sensor_path} does not match "
-                        "MonoGS's official EuRoC calibration: "
-                        f"sensor.yaml={actual_distortion.tolist()}, "
-                        f"MonoGS={expected_distortion.tolist()}"
-                    )
