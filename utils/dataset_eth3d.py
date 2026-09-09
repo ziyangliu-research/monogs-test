@@ -16,6 +16,12 @@ ETH3D_SEQUENCES = {
     "plant_scene_3",
 }
 
+# ETH3D's official SLAM evaluator uses 1/75 s as the default maximum timespan
+# between two ground-truth measurements that may be interpolated. Image
+# timestamps that fall into larger GT holes are excluded from trajectory
+# evaluation rather than forcing a long-gap interpolation.
+ETH3D_OFFICIAL_MAX_GT_INTERPOLATION_TIMESPAN_SEC = 1.0 / 75.0
+
 
 def apply_eth3d_sequence_override(config, sequence):
     if sequence is None:
@@ -113,9 +119,15 @@ def _stereo_calibration_dict(K_left, K_right, width, height, baseline):
                 "rows": 3,
                 "cols": 3,
                 "data": [
-                    1.0, 0.0, 0.0,
-                    0.0, 1.0, 0.0,
-                    0.0, 0.0, 1.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
                 ],
             },
         }
@@ -156,6 +168,12 @@ class ETH3DRectifiedParser:
       calibration.json     = generated rectified intrinsics/baseline
       groundtruth_left.txt = rectified-left camera c2w pose
       timestamps.txt       = image filename stems / timestamps in seconds
+
+    ETH3D ground truth may contain holes. To match the official ETH3D SLAM
+    evaluator, a frame is trajectory-evaluable only if its GT pose can be
+    interpolated between two measurements whose time separation does not exceed
+    max_gt_interpolation_timespan_sec. Frames in larger holes remain fully valid
+    SLAM/rendering inputs; they are merely excluded from ATE evaluation.
     """
 
     def __init__(
@@ -164,21 +182,25 @@ class ETH3DRectifiedParser:
         start_idx=0,
         end_idx=-1,
         frame_stride=1,
-        max_gt_gap_sec=0.1,
+        max_gt_interpolation_timespan_sec=ETH3D_OFFICIAL_MAX_GT_INTERPOLATION_TIMESPAN_SEC,
         require_right=True,
     ):
         self.input_folder = os.path.abspath(os.path.expanduser(input_folder))
         self.start_idx = int(start_idx)
         self.end_idx = int(end_idx) if end_idx is not None else -1
         self.frame_stride = int(frame_stride)
-        self.max_gt_gap_sec = float(max_gt_gap_sec)
+        self.max_gt_interpolation_timespan_sec = float(
+            max_gt_interpolation_timespan_sec
+        )
 
         if self.start_idx < 0:
             raise ValueError("ETH3D start_idx must be >= 0")
         if self.frame_stride <= 0:
             raise ValueError("ETH3D frame_stride must be > 0")
-        if self.max_gt_gap_sec <= 0:
-            raise ValueError("ETH3D max_gt_gap_sec must be > 0")
+        if self.max_gt_interpolation_timespan_sec <= 0:
+            raise ValueError(
+                "ETH3D max_gt_interpolation_timespan_sec must be > 0"
+            )
 
         timestamps_path = os.path.join(self.input_folder, "timestamps.txt")
         if not os.path.isfile(timestamps_path):
@@ -218,7 +240,24 @@ class ETH3DRectifiedParser:
         self.n_img = len(self.indices)
 
         self.pose_file = os.path.join(self.input_folder, "groundtruth_left.txt")
-        self.poses = self._load_poses(self.pose_file, self.timestamps)
+        self.poses, self.gt_valid_mask = self._load_poses(
+            self.pose_file, self.timestamps
+        )
+        valid_count = int(np.count_nonzero(self.gt_valid_mask))
+        invalid_count = int(self.n_img - valid_count)
+        if valid_count < 2:
+            raise ValueError(
+                f"ETH3D sequence has fewer than two evaluable GT frames: {valid_count}"
+            )
+        if invalid_count:
+            print(
+                "MonoGS: ETH3D sparse GT: "
+                f"{valid_count}/{self.n_img} image timestamps are ATE-evaluable; "
+                f"{invalid_count} frames fall outside valid GT interpolation spans "
+                f"(max span={self.max_gt_interpolation_timespan_sec:.9f}s) and "
+                "will remain in SLAM/rendering but be excluded from ATE.",
+                flush=True,
+            )
 
     def _load_poses(self, pose_file, image_timestamps):
         if not os.path.isfile(pose_file):
@@ -234,40 +273,58 @@ class ETH3DRectifiedParser:
         gt_ts = data[:, 0]
         if np.any(np.diff(gt_ts) <= 0):
             raise ValueError("ETH3D GT timestamps must be strictly increasing")
+        if len(gt_ts) < 2:
+            raise ValueError("ETH3D ground truth must contain at least two poses")
 
         poses = []
+        gt_valid = []
         for ts in image_timestamps:
-            pos = int(np.searchsorted(gt_ts, ts))
-            if pos < len(gt_ts) and abs(gt_ts[pos] - ts) < 1e-9:
-                trans = data[pos, 1:4]
-                quat = data[pos, 4:8]
-            elif pos == 0:
-                if abs(gt_ts[0] - ts) > self.max_gt_gap_sec:
-                    raise ValueError(f"ETH3D image timestamp {ts} precedes usable GT")
+            # Match ETH3D's official ComputePosesAtTimestamps(): choose the first
+            # GT measurement strictly after the image timestamp and interpolate
+            # from the immediately preceding measurement. Start/end extrapolation
+            # and intervals exceeding the official maximum interpolation timespan
+            # are not valid for trajectory evaluation.
+            next_idx = int(np.searchsorted(gt_ts, ts, side="right"))
+            valid = False
+
+            if 0 < next_idx < len(gt_ts):
+                prev_idx = next_idx - 1
+                t0 = float(gt_ts[prev_idx])
+                t1 = float(gt_ts[next_idx])
+                gap = t1 - t0
+                if gap > 0 and gap <= self.max_gt_interpolation_timespan_sec:
+                    alpha = float(np.clip((ts - t0) / gap, 0.0, 1.0))
+                    trans = (
+                        (1.0 - alpha) * data[prev_idx, 1:4]
+                        + alpha * data[next_idx, 1:4]
+                    )
+                    quat = _slerp_xyzw(
+                        data[prev_idx, 4:8], data[next_idx, 4:8], alpha
+                    )
+                    valid = True
+                else:
+                    # Placeholder GT for MonoGS Camera.R_gt/T_gt only. Those fields
+                    # are not used by the tracking/mapping algorithm; this frame is
+                    # excluded from trajectory evaluation through gt_valid_mask.
+                    nearest_idx = (
+                        prev_idx
+                        if abs(ts - t0) <= abs(t1 - ts)
+                        else next_idx
+                    )
+                    trans = data[nearest_idx, 1:4]
+                    quat = data[nearest_idx, 4:8]
+            elif next_idx == 0:
                 trans = data[0, 1:4]
                 quat = data[0, 4:8]
-            elif pos >= len(gt_ts):
-                if abs(ts - gt_ts[-1]) > self.max_gt_gap_sec:
-                    raise ValueError(f"ETH3D image timestamp {ts} exceeds usable GT")
+            else:
                 trans = data[-1, 1:4]
                 quat = data[-1, 4:8]
-            else:
-                t0, t1 = gt_ts[pos - 1], gt_ts[pos]
-                gap = float(t1 - t0)
-                if gap <= 0 or gap > self.max_gt_gap_sec:
-                    raise ValueError(
-                        f"ETH3D GT gap {gap:.6f}s around image timestamp {ts} exceeds "
-                        f"max_gt_gap_sec={self.max_gt_gap_sec}"
-                    )
-                alpha = float((ts - t0) / gap)
-                trans = (1.0 - alpha) * data[pos - 1, 1:4] + alpha * data[pos, 1:4]
-                quat = _slerp_xyzw(
-                    data[pos - 1, 4:8], data[pos, 4:8], alpha
-                )
 
             T_w_c = _pose_c2w(trans, quat)
             poses.append(np.linalg.inv(T_w_c))
-        return poses
+            gt_valid.append(valid)
+
+        return poses, np.asarray(gt_valid, dtype=bool)
 
 
 class ETH3DStereoDataset(StereoDataset):
@@ -312,21 +369,27 @@ class ETH3DStereoDataset(StereoDataset):
             start_idx=dataset_cfg.get("start_idx", 0),
             end_idx=dataset_cfg.get("end_idx", -1),
             frame_stride=dataset_cfg.get("frame_stride", 1),
-            max_gt_gap_sec=dataset_cfg.get("max_gt_gap_sec", 0.1),
+            max_gt_interpolation_timespan_sec=dataset_cfg.get(
+                "max_gt_interpolation_timespan_sec",
+                ETH3D_OFFICIAL_MAX_GT_INTERPOLATION_TIMESPAN_SEC,
+            ),
             require_right=True,
         )
         self.num_imgs = parser.n_img
         self.color_paths = parser.color_paths
         self.color_paths_r = parser.color_paths_r
         self.poses = parser.poses
+        self.gt_valid_mask = parser.gt_valid_mask
         self.pose_file = parser.pose_file
         self.frame_indices = parser.indices
         self.timestamps = parser.timestamps
 
+        valid_gt = int(np.count_nonzero(self.gt_valid_mask))
         print(
             "MonoGS: loaded ETH3D rectified stereo sequence "
             f"{dataset_path} ({self.num_imgs} frames, {self.width}x{self.height}, "
-            f"bf={self.bf:.6f}, GT={self.pose_file})"
+            f"bf={self.bf:.6f}, ATE_GT={valid_gt}/{self.num_imgs}, "
+            f"GT={self.pose_file})"
         )
 
     def __getitem__(self, idx):
@@ -389,18 +452,24 @@ class ETH3DMonocularDataset(MonocularDataset):
             start_idx=dataset_cfg.get("start_idx", 0),
             end_idx=dataset_cfg.get("end_idx", -1),
             frame_stride=dataset_cfg.get("frame_stride", 1),
-            max_gt_gap_sec=dataset_cfg.get("max_gt_gap_sec", 0.1),
+            max_gt_interpolation_timespan_sec=dataset_cfg.get(
+                "max_gt_interpolation_timespan_sec",
+                ETH3D_OFFICIAL_MAX_GT_INTERPOLATION_TIMESPAN_SEC,
+            ),
             require_right=False,
         )
         self.num_imgs = parser.n_img
         self.color_paths = parser.color_paths
         self.poses = parser.poses
+        self.gt_valid_mask = parser.gt_valid_mask
         self.pose_file = parser.pose_file
         self.frame_indices = parser.indices
         self.timestamps = parser.timestamps
 
+        valid_gt = int(np.count_nonzero(self.gt_valid_mask))
         print(
             "MonoGS: loaded ETH3D rectified monocular sequence "
             f"{dataset_path} ({self.num_imgs} left RGB frames, "
-            f"{self.width}x{self.height}, GT={self.pose_file})"
+            f"{self.width}x{self.height}, ATE_GT={valid_gt}/{self.num_imgs}, "
+            f"GT={self.pose_file})"
         )
