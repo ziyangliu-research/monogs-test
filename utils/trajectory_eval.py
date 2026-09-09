@@ -53,6 +53,25 @@ def source_frame_id(dataset, local_idx):
     return int(frame_indices[local_idx])
 
 
+def ground_truth_is_valid(dataset, local_idx):
+    """Return whether this dataset frame has trajectory-evaluable GT.
+
+    Most datasets expose GT for every frame and therefore return True. ETH3D's
+    processed SLAM ground truth may contain timestamp holes; its adapter exposes
+    gt_valid_mask so frames inside holes stay in SLAM/rendering but are excluded
+    from ATE, matching the official ETH3D evaluator's behavior.
+    """
+    valid_mask = getattr(dataset, "gt_valid_mask", None)
+    if valid_mask is None:
+        return True
+    if local_idx < 0 or local_idx >= len(valid_mask):
+        raise IndexError(
+            f"GT-valid mask does not contain local frame {local_idx}; "
+            f"mask length={len(valid_mask)}"
+        )
+    return bool(valid_mask[local_idx])
+
+
 def save_frame_indexed_trajectories(frames, dataset, save_dir):
     """Save estimated and GT C2W trajectories with original dataset frame IDs.
 
@@ -61,14 +80,22 @@ def save_frame_indexed_trajectories(frames, dataset, save_dir):
 
     Using original frame IDs makes partial trajectories from other systems directly
     comparable by intersecting the available frame IDs.
+
+    If a dataset exposes ``gt_valid_mask`` (currently ETH3D), frames without
+    safely interpolatable GT are omitted from both trajectory files. This is
+    evaluation-only filtering: those frames have already participated normally in
+    tracking, holdout splitting, mapping decisions, and rendering evaluation.
     """
     trajectory_dir = os.path.join(save_dir, "trajectory")
     os.makedirs(trajectory_dir, exist_ok=True)
     est_path = os.path.join(trajectory_dir, "trajectory_est.txt")
     gt_path = os.path.join(trajectory_dir, "trajectory_gt.txt")
+    invalid_gt_path = os.path.join(trajectory_dir, "gt_invalid_frame_ids.txt")
 
     local_ids = sorted(int(idx) for idx in frames.keys())
     header = "# frame_id tx ty tz qx qy qz qw\n"
+    saved_count = 0
+    invalid_gt_frame_ids = []
 
     with open(est_path, "w", encoding="utf-8") as f_est, open(
         gt_path, "w", encoding="utf-8"
@@ -76,21 +103,38 @@ def save_frame_indexed_trajectories(frames, dataset, save_dir):
         f_est.write(header)
         f_gt.write(header)
         for local_idx in local_ids:
-            frame = frames[local_idx]
             frame_id = source_frame_id(dataset, local_idx)
-            est = _c2w_to_pose7(np.linalg.inv(_w2c_from_camera(frame, ground_truth=False)))
-            gt = _c2w_to_pose7(np.linalg.inv(_w2c_from_camera(frame, ground_truth=True)))
+            if not ground_truth_is_valid(dataset, local_idx):
+                invalid_gt_frame_ids.append(frame_id)
+                continue
+
+            frame = frames[local_idx]
+            est = _c2w_to_pose7(
+                np.linalg.inv(_w2c_from_camera(frame, ground_truth=False))
+            )
+            gt = _c2w_to_pose7(
+                np.linalg.inv(_w2c_from_camera(frame, ground_truth=True))
+            )
             f_est.write(
                 f"{frame_id:d} " + " ".join(f"{v:.9f}" for v in est) + "\n"
             )
             f_gt.write(
                 f"{frame_id:d} " + " ".join(f"{v:.9f}" for v in gt) + "\n"
             )
+            saved_count += 1
+
+    with open(invalid_gt_path, "w", encoding="utf-8") as f:
+        f.write("# source frame IDs excluded from ATE because GT interpolation is invalid\n")
+        for frame_id in invalid_gt_frame_ids:
+            f.write(f"{frame_id:d}\n")
 
     return {
         "estimated": est_path,
         "ground_truth": gt_path,
-        "num_saved": len(local_ids),
+        "num_saved": int(saved_count),
+        "num_input_camera_poses": int(len(local_ids)),
+        "num_skipped_invalid_gt": int(len(invalid_gt_frame_ids)),
+        "invalid_gt_frame_ids": invalid_gt_path,
     }
 
 
