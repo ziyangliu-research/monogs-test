@@ -112,7 +112,11 @@ def _stereo_calibration_dict(K_left, K_right, width, height, baseline):
             "R": {
                 "rows": 3,
                 "cols": 3,
-                "data": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+                "data": [
+                    1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0,
+                ],
             },
         }
 
@@ -187,8 +191,12 @@ class ETH3DRectifiedParser:
         if np.any(np.diff(timestamps) <= 0):
             raise ValueError("ETH3D timestamps must be strictly increasing")
 
-        all_left = [os.path.join(self.input_folder, "image_left", s + ".png") for s in stems]
-        all_right = [os.path.join(self.input_folder, "image_right", s + ".png") for s in stems]
+        all_left = [
+            os.path.join(self.input_folder, "image_left", s + ".png") for s in stems
+        ]
+        all_right = [
+            os.path.join(self.input_folder, "image_right", s + ".png") for s in stems
+        ]
         for path in all_left:
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"ETH3D left image missing: {path}")
@@ -253,7 +261,9 @@ class ETH3DRectifiedParser:
                     )
                 alpha = float((ts - t0) / gap)
                 trans = (1.0 - alpha) * data[pos - 1, 1:4] + alpha * data[pos, 1:4]
-                quat = _slerp_xyzw(data[pos - 1, 4:8], data[pos, 4:8], alpha)
+                quat = _slerp_xyzw(
+                    data[pos - 1, 4:8], data[pos, 4:8], alpha
+                )
 
             T_w_c = _pose_c2w(trans, quat)
             poses.append(np.linalg.inv(T_w_c))
@@ -287,7 +297,9 @@ class ETH3DStereoDataset(StereoDataset):
         self.block_size = int(stereo_cfg.get("block_size", 20))
         self.uniqueness_ratio = int(stereo_cfg.get("uniqueness_ratio", 40))
         if self.num_disparities <= 0 or self.num_disparities % 16 != 0:
-            raise ValueError("StereoMatching.num_disparities must be a positive multiple of 16")
+            raise ValueError(
+                "StereoMatching.num_disparities must be a positive multiple of 16"
+            )
         self.stereo_matcher = cv2.StereoSGBM_create(
             minDisparity=0,
             numDisparities=self.num_disparities,
@@ -343,7 +355,10 @@ class ETH3DStereoDataset(StereoDataset):
         # SGBM grayscale-only, but preserve RGB for MonoGS photometric mapping.
         left_gray = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2GRAY)
         right_gray = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2GRAY)
-        disparity = self.stereo_matcher.compute(left_gray, right_gray).astype(np.float32) / 16.0
+        disparity = (
+            self.stereo_matcher.compute(left_gray, right_gray).astype(np.float32)
+            / 16.0
+        )
         depth = np.zeros_like(disparity, dtype=np.float32)
         valid = np.isfinite(disparity) & (disparity > 0.0)
         depth[valid] = self.bf / disparity[valid]
