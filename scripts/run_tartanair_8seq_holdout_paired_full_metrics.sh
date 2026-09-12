@@ -48,6 +48,7 @@ echo "Sequences: ${SEQUENCES[*]}" | tee -a "$STATUS_FILE"
 echo "Protocol: one online run -> exact online-final snapshot -> released 26000-iter color refinement -> paired pre/post evaluation" | tee -a "$STATUS_FILE"
 echo "ATE: SE(3) for both mono and stereo" | tee -a "$STATUS_FILE"
 echo "Timing: metric rendering and snapshot I/O are excluded; w/o CR time=online; +CR time=online+offline refinement" | tee -a "$STATUS_FILE"
+echo "Images: save only held-out test PNGs from the online-final map; post-CR metrics are computed without saving post-CR PNGs" | tee -a "$STATUS_FILE"
 
 find_pair_file() {
     local seq="$1"
@@ -74,6 +75,7 @@ for SEQ in "${SEQUENCES[@]}"; do
         --sequence "$SEQ" \
         --holdout-every 5 \
         --holdout-offset 4 \
+        --save-test-images-online-only \
         2>&1 | tee "$LOG_FILE"
 
     STATUS=${PIPESTATUS[0]}
