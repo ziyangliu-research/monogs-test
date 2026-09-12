@@ -104,6 +104,40 @@ def split_rows(per_frame, holdout_every, holdout_offset):
     return train_rows, test_rows
 
 
+def keep_only_holdout_images(save_dir, iteration, holdout_every, holdout_offset):
+    """Keep only held-out PNGs after a full metric render pass.
+
+    Metrics are still computed over every frame.  This helper only prunes image
+    files after evaluation so the saved visualization set contains test frames
+    without changing Train/Test metric computation.
+    """
+    kept = 0
+    removed = 0
+    for kind in ("rendered", "gt"):
+        image_dir = os.path.join(save_dir, "psnr", str(iteration), kind)
+        if not os.path.isdir(image_dir):
+            continue
+        for name in os.listdir(image_dir):
+            if not name.lower().endswith(".png"):
+                continue
+            stem = os.path.splitext(name)[0]
+            try:
+                frame_id = int(stem)
+            except ValueError:
+                continue
+            path = os.path.join(image_dir, name)
+            if frame_id % holdout_every == holdout_offset:
+                kept += 1
+            else:
+                os.remove(path)
+                removed += 1
+    Log(
+        "Pruned saved render images to held-out split",
+        f"iteration={iteration} | kept={kept} | removed={removed}",
+        tag="Eval",
+    )
+
+
 def make_row(
     variant,
     sequence,
@@ -157,12 +191,26 @@ def main():
     parser.add_argument("--holdout-every", type=int, default=5)
     parser.add_argument("--holdout-offset", type=int, default=4)
     parser.add_argument("--save-images", action="store_true")
+    parser.add_argument(
+        "--save-test-images-online-only",
+        action="store_true",
+        help=(
+            "Save PNGs only for held-out test frames of the exact online-final map. "
+            "Train/Test metrics are still computed for all frames, and post-CR "
+            "metrics are still computed without saving post-CR PNGs."
+        ),
+    )
     args = parser.parse_args(sys.argv[1:])
 
     if args.holdout_every <= 1:
         raise ValueError("--holdout-every must be > 1")
     if not 0 <= args.holdout_offset < args.holdout_every:
         raise ValueError("--holdout-offset must be in [0, holdout_every)")
+    if args.save_images and args.save_test_images_online_only:
+        raise ValueError(
+            "Use either --save-images (all pre/post images) or "
+            "--save-test-images-online-only, not both"
+        )
 
     mp.set_start_method("spawn")
 
@@ -208,7 +256,8 @@ def main():
     monogs_slam.BackEnd = PairedBenchmarkBackEnd
 
     # Post-CR metrics are evaluated inside SLAM while the backend CUDA producer
-    # is alive.  Image writing remains optional and does not affect metrics.
+    # is alive.  Under --save-test-images-online-only, post-CR image writing is
+    # disabled while all post-CR metrics are still computed normally.
     original_eval_rendering = monogs_slam.eval_rendering
 
     def benchmark_eval_rendering(*call_args, **call_kwargs):
@@ -255,6 +304,7 @@ def main():
     pre_gaussians.load_ply(pre_ply)
     torch.cuda.synchronize()
 
+    save_online_images = bool(args.save_images or args.save_test_images_online_only)
     original_eval_rendering(
         runner.frontend.cameras,
         pre_gaussians,
@@ -266,12 +316,20 @@ def main():
         iteration="online_final",
         interval=1,
         skip_keyframes=False,
-        save_images=bool(args.save_images),
+        save_images=save_online_images,
         mask_nonzero=False,
     )
     torch.cuda.synchronize()
     del pre_gaussians
     torch.cuda.empty_cache()
+
+    if args.save_test_images_online_only:
+        keep_only_holdout_images(
+            save_dir,
+            "online_final",
+            args.holdout_every,
+            args.holdout_offset,
+        )
 
     with open(
         os.path.join(save_dir, "psnr", "online_final", "per_frame_metrics.json"),
@@ -354,6 +412,13 @@ def main():
             "test_rendering": post_test,
             "benchmark_row": post_row,
         },
+        "saved_image_policy": (
+            "online_test_only"
+            if args.save_test_images_online_only
+            else "all_online_and_post_cr"
+            if args.save_images
+            else "none"
+        ),
         "metric_evaluation_excluded_from_system_time": True,
         "cuda_ipc_safe_eval": True,
     }
