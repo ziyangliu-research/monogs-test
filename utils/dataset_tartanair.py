@@ -179,7 +179,12 @@ class TartanAirMonoParser(TartanAirStereoParser):
 
 
 class TartanAirStereoDataset(StereoDataset):
-    """MonoGS stereo adapter for TartanAir v1 challenge data."""
+    """MonoGS stereo adapter for TartanAir v1 challenge RGB data.
+
+    The released MonoGS stereo SGBM settings are preserved and still operate on
+    grayscale images.  The left RGB image itself is retained for photometric
+    tracking/mapping/rendering, which is necessary for a fair RGB benchmark.
+    """
 
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
@@ -226,7 +231,7 @@ class TartanAirStereoDataset(StereoDataset):
         self.frame_indices = parser.indices
 
         print(
-            "MonoGS: loaded TartanAir stereo sequence "
+            "MonoGS: loaded TartanAir stereo RGB sequence "
             f"{dataset_cfg['dataset_path']} ({self.num_imgs} frames, "
             f"bf={self.bf:.3f}, GT={self.pose_file})"
         )
@@ -236,38 +241,47 @@ class TartanAirStereoDataset(StereoDataset):
         color_path_r = self.color_paths_r[idx]
         pose = self.poses[idx]
 
-        image = cv2.imread(color_path, cv2.IMREAD_GRAYSCALE)
-        image_r = cv2.imread(color_path_r, cv2.IMREAD_GRAYSCALE)
-        if image is None or image_r is None:
+        left_bgr = cv2.imread(color_path, cv2.IMREAD_COLOR)
+        right_bgr = cv2.imread(color_path_r, cv2.IMREAD_COLOR)
+        if left_bgr is None or right_bgr is None:
             raise FileNotFoundError(
                 f"Failed to read TartanAir stereo pair: {color_path}, {color_path_r}"
             )
 
-        if image.shape != (self.height, self.width):
+        if left_bgr.shape[:2] != (self.height, self.width):
             raise ValueError(
-                f"Unexpected left image size {image.shape}; expected "
+                f"Unexpected left image size {left_bgr.shape[:2]}; expected "
                 f"({self.height}, {self.width})"
             )
-        if image_r.shape != (self.height, self.width):
+        if right_bgr.shape[:2] != (self.height, self.width):
             raise ValueError(
-                f"Unexpected right image size {image_r.shape}; expected "
+                f"Unexpected right image size {right_bgr.shape[:2]}; expected "
                 f"({self.height}, {self.width})"
             )
 
+        # TartanAir challenge images are already rectified, but keep the generic
+        # remap path intact in case a future config marks them as distorted.
         if self.disorted:
-            image = cv2.remap(image, self.map1x, self.map1y, cv2.INTER_LINEAR)
-            image_r = cv2.remap(image_r, self.map1x_r, self.map1y_r, cv2.INTER_LINEAR)
+            left_bgr = cv2.remap(left_bgr, self.map1x, self.map1y, cv2.INTER_LINEAR)
+            right_bgr = cv2.remap(
+                right_bgr, self.map1x_r, self.map1y_r, cv2.INTER_LINEAR
+            )
 
-        disparity = self.stereo_matcher.compute(image, image_r).astype(np.float32) / 16.0
+        # Preserve MonoGS stereo depth estimation: SGBM runs on grayscale only.
+        left_gray = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2GRAY)
+        right_gray = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2GRAY)
+        disparity = (
+            self.stereo_matcher.compute(left_gray, right_gray).astype(np.float32)
+            / 16.0
+        )
         depth = np.zeros_like(disparity, dtype=np.float32)
         valid = np.isfinite(disparity) & (disparity > 0.0)
         depth[valid] = self.bf / disparity[valid]
 
-        # Preserve MonoGS's original stereo behavior: SGBM runs on grayscale and the
-        # left grayscale image is replicated to three channels for tracking/mapping.
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        # MonoGS/Gaussian rendering expects channel order RGB. OpenCV imread is BGR.
+        left_rgb = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2RGB)
         image = (
-            torch.from_numpy(image / 255.0)
+            torch.from_numpy(left_rgb.copy() / 255.0)
             .clamp(0.0, 1.0)
             .permute(2, 0, 1)
             .to(device=self.device, dtype=self.dtype)
