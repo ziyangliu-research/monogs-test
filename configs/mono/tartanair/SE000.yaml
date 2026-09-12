@@ -1,0 +1,7 @@
+inherit_from: "configs/mono/tartanair/base_config.yaml"
+
+Dataset:
+  dataset_path: "/home/shiyo/Desktop/Datasets/TartanAir_Stereo_Challenge/stereo/SE000"
+  start_idx: 0
+  end_idx: -1
+  frame_stride: 1

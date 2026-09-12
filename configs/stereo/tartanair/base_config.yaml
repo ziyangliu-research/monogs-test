@@ -1,0 +1,85 @@
+inherit_from: "configs/stereo/euroc/base_config.yaml"
+
+Results:
+  save_results: True
+  save_dir: "results"
+  save_trj: True
+  use_gui: False
+  eval_rendering: False
+  use_wandb: False
+
+Dataset:
+  type: 'tartanair_stereo'
+  sensor_type: 'stereo'
+  start_idx: 0
+  end_idx: -1
+  frame_stride: 1
+
+  # TartanAir v1 / CVPR Visual SLAM Challenge stereo calibration.
+  # Images are already rectified pinhole stereo pairs.
+  Calibration:
+    baseline: 0.25
+    distorted: False
+    width: 640
+    height: 480
+    cam0:
+      raw:
+        fx: 320.0
+        fy: 320.0
+        cx: 320.0
+        cy: 240.0
+        k1: 0.0
+        k2: 0.0
+        p1: 0.0
+        p2: 0.0
+        k3: 0.0
+      opt:
+        fx: 320.0
+        fy: 320.0
+        cx: 320.0
+        cy: 240.0
+        k1: 0.0
+        k2: 0.0
+        p1: 0.0
+        p2: 0.0
+        k3: 0.0
+      R:
+        rows: 3
+        cols: 3
+        data: [1.0, 0.0, 0.0,
+               0.0, 1.0, 0.0,
+               0.0, 0.0, 1.0]
+    cam1:
+      raw:
+        fx: 320.0
+        fy: 320.0
+        cx: 320.0
+        cy: 240.0
+        k1: 0.0
+        k2: 0.0
+        p1: 0.0
+        p2: 0.0
+        k3: 0.0
+      opt:
+        fx: 320.0
+        fy: 320.0
+        cx: 320.0
+        cy: 240.0
+        k1: 0.0
+        k2: 0.0
+        p1: 0.0
+        p2: 0.0
+        k3: 0.0
+      R:
+        rows: 3
+        cols: 3
+        data: [1.0, 0.0, 0.0,
+               0.0, 1.0, 0.0,
+               0.0, 0.0, 1.0]
+
+  # Keep the released MonoGS stereo SGBM defaults. For TartanAir, bf is
+  # computed from baseline * fx = 0.25 * 320 = 80.0.
+  StereoMatching:
+    num_disparities: 64
+    block_size: 20
+    uniqueness_ratio: 40

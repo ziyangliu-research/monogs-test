@@ -1,0 +1,32 @@
+inherit_from: "configs/mono/tum/base_config.yaml"
+
+Results:
+  save_results: True
+  save_dir: "results"
+  save_trj: True
+  use_gui: False
+  eval_rendering: False
+  use_wandb: False
+
+Dataset:
+  type: 'tartanair_mono'
+  sensor_type: 'monocular'
+  start_idx: 0
+  end_idx: -1
+  frame_stride: 1
+
+  # TartanAir v1 / CVPR Visual SLAM Challenge left-camera intrinsics.
+  # Monocular baseline uses image_left only; image_right and stereo depth are not read.
+  Calibration:
+    fx: 320.0
+    fy: 320.0
+    cx: 320.0
+    cy: 240.0
+    width: 640
+    height: 480
+    distorted: False
+    k1: 0.0
+    k2: 0.0
+    p1: 0.0
+    p2: 0.0
+    k3: 0.0

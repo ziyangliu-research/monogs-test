@@ -1,0 +1,6 @@
+inherit_from: "configs/stereo/tartanair/SE000.yaml"
+
+Dataset:
+  start_idx: 0
+  end_idx: 50
+  frame_stride: 1
